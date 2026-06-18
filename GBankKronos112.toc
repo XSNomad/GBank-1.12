@@ -1,0 +1,7 @@
+## Interface: 11200
+## Title: GBankKronos112
+## Notes: Fake guild bank viewer for Vanilla 1.12 bank alts. Scan, sync, search, and track minimum stock.
+## Author: ChatGPT for LEVEL UP
+## Version: 0.2.0
+## SavedVariables: GBankKronos112DB
+GBankKronos112.lua
