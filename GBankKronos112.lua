@@ -2,14 +2,15 @@
 -- Lightweight fake guild bank for Vanilla 1.12 private servers.
 -- Bank alt scans bags/bank/mail, then syncs a cached snapshot to guild members.
 -- Security model:
--- Only players with "gbank" in their guild officer note can scan/sync/send bank snapshots.
--- If officer notes cannot be read, scan/sync/accept is skipped.
+-- Only players with "gbank" in their guild officer note can create/scan bank snapshots.
+-- Any guild member may relay a cached snapshot, but the snapshot owner must still be marked "gbank".
+-- If officer notes cannot be read, scan and ownership validation are skipped.
 
 GBankKronos112DB = GBankKronos112DB or {}
 
 local ADDON = "GBankKronos112"
 local PREFIX = "GBK112"
-local VERSION = "0.2.4"
+local VERSION = "0.2.5"
 local DELIM = "~"
 
 local BANKER_NOTE_TOKEN = "gbank"
@@ -126,6 +127,38 @@ end
 
 local function IsPlayerAuthorizedBanker()
     return IsAuthorizedBanker(PlayerName())
+end
+
+local function BankSnapshotOwner(bankName)
+    EnsureDB()
+
+    local bank = GBankKronos112DB.banks and GBankKronos112DB.banks[bankName]
+
+    if not bank then return "" end
+    if bank.owner and bank.owner ~= "" then return bank.owner end
+
+    return bankName or ""
+end
+
+local function CanRelayCachedBank(bankName)
+    EnsureDB()
+
+    local bank = GBankKronos112DB.banks and GBankKronos112DB.banks[bankName]
+
+    if not bank then return false end
+
+    -- Bank alts with the gbank tag can always send their own cache.
+    if IsPlayerAuthorizedBanker() then
+        return true
+    end
+
+    -- Non-bank officers or alts may relay only snapshots created by a real gbank owner.
+    -- This keeps /gbank scan protected while allowing /gbank request to work from cached copies.
+    local owner = BankSnapshotOwner(bankName)
+
+    if owner == "" then return false end
+
+    return IsAuthorizedBanker(owner)
 end
 
 local function PurgeUnauthorizedBanks()
@@ -510,18 +543,26 @@ end
 local function SyncBank(bankName)
     EnsureDB()
 
-    if not IsPlayerAuthorizedBanker() then
+    local bank = GBankKronos112DB.banks[bankName]
+    if not bank then return false end
+
+    if not CanRelayCachedBank(bankName) then
         RequestGuildRoster()
-        Print("sync blocked. Your guild officer note must contain '" .. BANKER_NOTE_TOKEN .. "'. If officer notes are not readable, sync is skipped.")
-        return
+        Print("sync skipped for " .. tostring(bankName) .. ". Snapshot owner is not marked '" .. BANKER_NOTE_TOKEN .. "', or officer notes are not readable.")
+        return false
     end
 
-    local bank = GBankKronos112DB.banks[bankName]
-    if not bank then return end
-
+    local owner = BankSnapshotOwner(bankName)
     local session = tostring(Now()) .. tostring(math.random(100, 999))
 
-    Send("START" .. DELIM .. session .. DELIM .. SerializeSafe(bankName) .. DELIM .. tostring(bank.updated or Now()) .. DELIM .. VERSION)
+    Send(
+        "START" .. DELIM ..
+        session .. DELIM ..
+        SerializeSafe(bankName) .. DELIM ..
+        tostring(bank.updated or Now()) .. DELIM ..
+        VERSION .. DELIM ..
+        SerializeSafe(owner)
+    )
 
     local key, item
 
@@ -538,26 +579,29 @@ local function SyncBank(bankName)
     end
 
     Send("END" .. DELIM .. session .. DELIM .. SerializeSafe(bankName))
+    return true
 end
 
 local function SyncAll()
     EnsureDB()
 
-    if not IsPlayerAuthorizedBanker() then
-        RequestGuildRoster()
-        Print("sync blocked. Your guild officer note must contain '" .. BANKER_NOTE_TOKEN .. "'. If officer notes are not readable, sync is skipped.")
-        return
-    end
-
     local sent = 0
+    local skipped = 0
     local bankName, bank
 
     for bankName, bank in pairs(GBankKronos112DB.banks) do
-        SyncBank(bankName)
-        sent = sent + 1
+        if SyncBank(bankName) then
+            sent = sent + 1
+        else
+            skipped = skipped + 1
+        end
     end
 
-    Print("synced " .. sent .. " bank snapshot(s) to guild.")
+    Print("synced " .. sent .. " cached bank snapshot(s) to guild.")
+
+    if skipped > 0 then
+        Print("skipped " .. skipped .. " snapshot(s) because the original owner could not be validated.")
+    end
 end
 
 local function SplitBar(msg)
@@ -579,18 +623,9 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local cmd = p[1]
 
     if cmd == "REQ" then
-        if IsPlayerAuthorizedBanker() and GBankKronos112DB and GBankKronos112DB.banks then
+        -- Anyone with a valid cached copy may answer. SyncBank validates each snapshot owner.
+        if GBankKronos112DB and GBankKronos112DB.banks then
             SyncAll()
-        end
-
-        return
-    end
-
-    if not IsAuthorizedBanker(sender) then
-        RequestGuildRoster()
-
-        if cmd == "START" or cmd == "ITEM" or cmd == "END" then
-            Print("ignored bank sync from " .. tostring(sender) .. ". Sender is not marked '" .. BANKER_NOTE_TOKEN .. "' in officer notes, or officer notes are not readable.")
         end
 
         return
@@ -600,13 +635,21 @@ local function OnAddonMessage(prefix, msg, channel, sender)
         local session = p[2]
         local bankName = p[3]
         local updated = tonumber(p[4]) or Now()
+        local snapshotOwner = p[6] or sender
 
         if not session or not bankName then return end
+
+        if not IsAuthorizedBanker(snapshotOwner) then
+            RequestGuildRoster()
+            Print("ignored bank snapshot " .. tostring(bankName) .. " from " .. tostring(sender) .. ". Snapshot owner " .. tostring(snapshotOwner) .. " is not marked '" .. BANKER_NOTE_TOKEN .. "', or officer notes are not readable.")
+            return
+        end
 
         GBK.incoming[session] = {
             bankName = bankName,
             updated = updated,
-            owner = sender,
+            owner = snapshotOwner,
+            sender = sender,
             items = {}
         }
 
@@ -655,7 +698,7 @@ local function OnAddonMessage(prefix, msg, channel, sender)
                 items = inc.items
             }
 
-            Print("received bank snapshot: " .. inc.bankName .. " from " .. inc.owner .. ".")
+            Print("received bank snapshot: " .. inc.bankName .. " from " .. tostring(inc.sender or inc.owner) .. " owned by " .. inc.owner .. ".")
 
             if GBK.frame and GBK.frame:IsVisible() then
                 GBK.Refresh()
@@ -1019,14 +1062,14 @@ local function Help()
     Print("commands:")
     Print("/gbank - open viewer")
     Print("/gbank scan [name] - scan bags, open bank, and open mailbox")
-    Print("/gbank sync - send cached bank snapshot to guild")
+    Print("/gbank sync - relay valid cached bank snapshot(s) to guild")
     Print("/gbank request - ask online officers for latest snapshot")
     Print("/gbank limit Item Name = 80 - set minimum stock")
     Print("/gbank stock - show low stock")
     Print("/gbank clear - clear local cached bank data")
     Print("/gbank reset - same as clear")
     Print("/gbank purge - remove cached bank tabs not owned by officer-note gbank players")
-    Print("bankers must have '" .. BANKER_NOTE_TOKEN .. "' in their guild officer note.")
+    Print("bankers who create snapshots must have '" .. BANKER_NOTE_TOKEN .. "' in their guild officer note. Cached snapshots may be relayed by others if the owner validates.")
 end
 
 local function Slash(msg)
