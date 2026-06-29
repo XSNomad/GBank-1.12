@@ -2,15 +2,18 @@
 -- Lightweight fake guild bank for Vanilla 1.12 private servers.
 -- Bank alt scans bags/bank/mail, then syncs a cached snapshot to guild members.
 -- Security model:
--- Only players with "gbank" in their guild officer note can create/scan bank snapshots.
--- Any guild member may relay a cached snapshot, but the snapshot owner must still be marked "gbank".
--- If officer notes cannot be read, scan and ownership validation are skipped.
+-- Gbank characters with "gbank" in their guild officer note can scan and sync.
+-- Officers can relay cached snapshots after verifying the snapshot owner has the "gbank" officer-note tag.
+-- Regular users can request and receive snapshots without reading officer notes.
 
 GBankKronos112DB = GBankKronos112DB or {}
 
+-- ============================================================
+-- CONSTANTS
+-- ============================================================
 local ADDON = "GBankKronos112"
 local PREFIX = "GBK112"
-local VERSION = "0.2.5"
+local VERSION = "0.2.6"
 local DELIM = "~"
 
 local BANKER_NOTE_TOKEN = "gbank"
@@ -21,6 +24,9 @@ local ROWS = ICON_COLS * ICON_ROWS
 local ICON_SIZE = 36
 local ICON_GAP = 6
 
+-- ============================================================
+-- STATE
+-- ============================================================
 local GBK = {}
 GBK.frame = nil
 GBK.rows = {}
@@ -31,300 +37,59 @@ GBK.view = {}
 GBK.incoming = {}
 GBK.lastAnnounce = 0
 
+-- ============================================================
+-- FORWARD DECLARATIONS
+-- ============================================================
+local Now
+local PlayerName
+local Lower
+local Trim
+local NormalizeName
+local Print
+local EnsureDB
+local RequestGuildRoster
+local IsAuthorizedBanker
+local IsPlayerAuthorizedBanker
+local BankSnapshotOwner
+local CanRelayCachedBank
+local PurgeUnauthorizedBanks
+local LinkName
+local LinkItemId
+local AddItem
+local ScanContainer
+local ScanMail
+local IsBankOpen
+local SnapshotName
+local ScanBankAlt
+local BuildFlatItems
+local LimitFor
+local SetLimit
+local AnnounceLowStock
+local Send
+local SerializeSafe
+local ItemString
+local ItemTexture
+local SyncBank
+local SyncAll
+local SplitBar
+local OnAddonMessage
+local FormatTime
+local SourcesText
+local SelectTab
+local MakeTabButton
 local RebuildTabButtons
+local CreateUI
+local ToggleUI
+local Help
+local Slash
 
-local function Now()
-    return time and time() or 0
-end
 
-local function PlayerName()
-    return UnitName("player") or "Unknown"
-end
+-- ============================================================
+-- GBANK FUNCTIONS
+-- Characters with the gbank officer-note tag can create and seed snapshots.
+-- ============================================================
 
-local function Lower(s)
-    if not s then return "" end
-    return string.lower(s)
-end
-
-local function Trim(s)
-    if not s then return "" end
-    s = string.gsub(s, "^%s+", "")
-    s = string.gsub(s, "%s+$", "")
-    return s
-end
-
-local function NormalizeName(name)
-    if not name then return "" end
-
-    local n = tostring(name)
-    local dash = string.find(n, "-", 1, true)
-
-    if dash then
-        n = string.sub(n, 1, dash - 1)
-    end
-
-    return Lower(Trim(n))
-end
-
-local function Print(msg)
-    DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffGBank|r: " .. tostring(msg))
-end
-
-local function EnsureDB()
-    if not GBankKronos112DB then GBankKronos112DB = {} end
-    if not GBankKronos112DB.banks then GBankKronos112DB.banks = {} end
-    if not GBankKronos112DB.limits then GBankKronos112DB.limits = {} end
-    if not GBankKronos112DB.options then GBankKronos112DB.options = {} end
-end
-
-local function RequestGuildRoster()
-    if GuildRoster then
-        GuildRoster()
-    end
-end
-
-local function IsAuthorizedBanker(name)
-    if not IsInGuild or not IsInGuild() then
-        return false
-    end
-
-    local target = NormalizeName(name)
-    if target == "" then return false end
-
-    if not GetNumGuildMembers or not GetGuildRosterInfo then
-        return false
-    end
-
-    local total = GetNumGuildMembers()
-
-    if not total or total < 1 then
-        RequestGuildRoster()
-        return false
-    end
-
-    local i
-    for i = 1, total do
-        local memberName, rank, rankIndex, level, class, zone, note, officerNote, online = GetGuildRosterInfo(i)
-
-        if NormalizeName(memberName) == target then
-            officerNote = officerNote or ""
-
-            if officerNote == "" then
-                return false
-            end
-
-            if string.find(Lower(officerNote), BANKER_NOTE_TOKEN, 1, true) then
-                return true
-            end
-
-            return false
-        end
-    end
-
-    RequestGuildRoster()
-    return false
-end
-
-local function IsPlayerAuthorizedBanker()
-    return IsAuthorizedBanker(PlayerName())
-end
-
-local function BankSnapshotOwner(bankName)
-    EnsureDB()
-
-    local bank = GBankKronos112DB.banks and GBankKronos112DB.banks[bankName]
-
-    if not bank then return "" end
-    if bank.owner and bank.owner ~= "" then return bank.owner end
-
-    return bankName or ""
-end
-
-local function CanRelayCachedBank(bankName)
-    EnsureDB()
-
-    local bank = GBankKronos112DB.banks and GBankKronos112DB.banks[bankName]
-
-    if not bank then return false end
-
-    -- Bank alts with the gbank tag can always send their own cache.
-    if IsPlayerAuthorizedBanker() then
-        return true
-    end
-
-    -- Non-bank officers or alts may relay only snapshots created by a real gbank owner.
-    -- This keeps /gbank scan protected while allowing /gbank request to work from cached copies.
-    local owner = BankSnapshotOwner(bankName)
-
-    if owner == "" then return false end
-
-    return IsAuthorizedBanker(owner)
-end
-
-local function PurgeUnauthorizedBanks()
-    EnsureDB()
-    RequestGuildRoster()
-
-    local removed = 0
-    local bankName, bank
-
-    for bankName, bank in pairs(GBankKronos112DB.banks or {}) do
-        local owner = bank.owner or ""
-
-        if owner == "" or not IsAuthorizedBanker(owner) then
-            GBankKronos112DB.banks[bankName] = nil
-            removed = removed + 1
-        end
-    end
-
-    GBK.tab = "ALL"
-    GBK.offset = 0
-
-    if GBK.frame then
-        RebuildTabButtons()
-        GBK.Refresh()
-    end
-
-    Print("purged " .. tostring(removed) .. " unauthorized bank snapshot(s).")
-end
-
-local function LinkName(link)
-    if not link then return nil end
-    local _, _, name = string.find(link, "%[(.-)%]")
-    return name
-end
-
-local function LinkItemId(link)
-    if not link then return "0" end
-    local _, _, id = string.find(link, "item:(%d+):")
-    return id or "0"
-end
-
-local function AddItem(items, name, itemId, count, source, slot, texture)
-    if not name or name == "" then return end
-    if not count or count < 1 then count = 1 end
-
-    local key = Lower(name)
-
-    if not items[key] then
-        items[key] = {
-            name = name,
-            id = itemId or "0",
-            count = 0,
-            source = source or "",
-            slots = {},
-            texture = texture or ""
-        }
-    end
-
-    items[key].count = items[key].count + count
-
-    if texture and texture ~= "" then
-        items[key].texture = texture
-    end
-
-    if source and slot then
-        table.insert(items[key].slots, source .. " " .. slot)
-    end
-end
-
-local function ScanContainer(items, bag, source)
-    local slots = GetContainerNumSlots(bag)
-    if not slots then return end
-
-    local i
-    for i = 1, slots do
-        local link = GetContainerItemLink(bag, i)
-
-        if link then
-            local texture, count = GetContainerItemInfo(bag, i)
-            local name = LinkName(link)
-            local itemId = LinkItemId(link)
-
-            AddItem(
-                items,
-                name,
-                itemId,
-                count or 1,
-                source,
-                tostring(bag) .. ":" .. tostring(i),
-                texture
-            )
-        end
-    end
-end
-
-local function ScanMail(items)
-    if not GetInboxNumItems then return 0 end
-    if MailFrame and not MailFrame:IsVisible() then return 0 end
-
-    local total = GetInboxNumItems()
-    if not total then return 0 end
-
-    local scanned = 0
-    local mailIndex
-
-    for mailIndex = 1, total do
-        local attachmentIndex
-
-        for attachmentIndex = 1, 16 do
-            local name = nil
-            local itemId = "0"
-            local count = 1
-            local texture = nil
-
-            if GetInboxItemLink then
-                local ok, itemLink = pcall(GetInboxItemLink, mailIndex, attachmentIndex)
-
-                if ok and itemLink then
-                    name = LinkName(itemLink)
-                    itemId = LinkItemId(itemLink)
-                end
-            end
-
-            if GetInboxItem then
-                local ok, itemName, itemTexture, itemCount = pcall(GetInboxItem, mailIndex, attachmentIndex)
-
-                if ok and itemName then
-                    if not name then name = itemName end
-                    if itemTexture then texture = itemTexture end
-                    if itemCount then count = itemCount end
-                end
-            end
-
-            if name then
-                AddItem(
-                    items,
-                    name,
-                    itemId,
-                    count,
-                    "Mail",
-                    tostring(mailIndex) .. ":" .. tostring(attachmentIndex),
-                    texture
-                )
-
-                scanned = scanned + 1
-            end
-        end
-    end
-
-    return scanned
-end
-
-local function IsBankOpen()
-    if BankFrame and BankFrame:IsVisible() then return true end
-    return false
-end
-
-local function SnapshotName(arg)
-    arg = Trim(arg or "")
-
-    if arg ~= "" then return arg end
-
-    return PlayerName()
-end
-
-local function ScanBankAlt(tabName)
+ScanBankAlt = function(tabName)
     EnsureDB()
 
     if not IsPlayerAuthorizedBanker() then
@@ -377,7 +142,149 @@ local function ScanBankAlt(tabName)
     end
 end
 
-local function BuildFlatItems()
+
+PurgeUnauthorizedBanks = function()
+    EnsureDB()
+    RequestGuildRoster()
+
+    local removed = 0
+    local bankName, bank
+
+    for bankName, bank in pairs(GBankKronos112DB.banks or {}) do
+        local owner = bank.owner or ""
+
+        if owner == "" or not IsAuthorizedBanker(owner) then
+            GBankKronos112DB.banks[bankName] = nil
+            removed = removed + 1
+        end
+    end
+
+    GBK.tab = "ALL"
+    GBK.offset = 0
+
+    if GBK.frame then
+        RebuildTabButtons()
+        GBK.Refresh()
+    end
+
+    Print("purged " .. tostring(removed) .. " unauthorized bank snapshot(s).")
+end
+
+
+
+-- ============================================================
+-- OFFICER FUNCTIONS
+-- Officers relay stored snapshots only after validating the snapshot owner.
+-- ============================================================
+
+BankSnapshotOwner = function(bankName)
+    EnsureDB()
+
+    local bank = GBankKronos112DB.banks and GBankKronos112DB.banks[bankName]
+
+    if not bank then return "" end
+    if bank.owner and bank.owner ~= "" then return bank.owner end
+
+    return bankName or ""
+end
+
+
+CanRelayCachedBank = function(bankName)
+    EnsureDB()
+
+    local bank = GBankKronos112DB.banks and GBankKronos112DB.banks[bankName]
+
+    if not bank then return false end
+
+    -- Gbank characters can scan and sync.
+    if IsPlayerAuthorizedBanker() then
+        return true
+    end
+
+    -- Officers may relay stored snapshots only if they can verify that the
+    -- original snapshot owner has the gbank officer-note tag.
+    -- Regular users cannot read officer notes, so this returns false for them.
+    local owner = BankSnapshotOwner(bankName)
+
+    if owner == "" then return false end
+
+    return IsAuthorizedBanker(owner)
+end
+
+
+SyncBank = function(bankName)
+    EnsureDB()
+
+    local bank = GBankKronos112DB.banks[bankName]
+    if not bank then return false end
+
+    if not CanRelayCachedBank(bankName) then
+        RequestGuildRoster()
+        Print("sync skipped for " .. tostring(bankName) .. ". Snapshot owner is not marked '" .. BANKER_NOTE_TOKEN .. "', or officer notes are not readable.")
+        return false
+    end
+
+    local owner = BankSnapshotOwner(bankName)
+    local session = tostring(Now()) .. tostring(math.random(100, 999))
+
+    Send(
+        "START" .. DELIM ..
+        session .. DELIM ..
+        SerializeSafe(bankName) .. DELIM ..
+        tostring(bank.updated or Now()) .. DELIM ..
+        VERSION .. DELIM ..
+        SerializeSafe(owner)
+    )
+
+    local key, item
+
+    for key, item in pairs(bank.items or {}) do
+        Send(
+            "ITEM" .. DELIM ..
+            session .. DELIM ..
+            SerializeSafe(bankName) .. DELIM ..
+            SerializeSafe(item.name) .. DELIM ..
+            tostring(item.id or "0") .. DELIM ..
+            tostring(item.count or 0) .. DELIM ..
+            SerializeSafe(item.texture or "")
+        )
+    end
+
+    Send("END" .. DELIM .. session .. DELIM .. SerializeSafe(bankName))
+    return true
+end
+
+
+SyncAll = function()
+    EnsureDB()
+
+    local sent = 0
+    local skipped = 0
+    local bankName, bank
+
+    for bankName, bank in pairs(GBankKronos112DB.banks) do
+        if SyncBank(bankName) then
+            sent = sent + 1
+        else
+            skipped = skipped + 1
+        end
+    end
+
+    Print("synced " .. sent .. " cached bank snapshot(s) to guild.")
+
+    if skipped > 0 then
+        Print("skipped " .. skipped .. " snapshot(s) because the original owner could not be validated.")
+    end
+end
+
+
+
+-- ============================================================
+-- ALL USER FUNCTIONS
+-- Regular users can request, receive, view, search, and check stock.
+-- ============================================================
+
+BuildFlatItems = function()
     EnsureDB()
 
     local flat = {}
@@ -431,12 +338,8 @@ local function BuildFlatItems()
     return flat
 end
 
-local function LimitFor(name)
-    EnsureDB()
-    return GBankKronos112DB.limits[Lower(name)] or 0
-end
 
-local function SetLimit(name, n)
+SetLimit = function(name, n)
     EnsureDB()
 
     name = Trim(name)
@@ -453,7 +356,8 @@ local function SetLimit(name, n)
     end
 end
 
-local function AnnounceLowStock()
+
+AnnounceLowStock = function()
     EnsureDB()
 
     local totals = {}
@@ -501,121 +405,8 @@ local function AnnounceLowStock()
     end
 end
 
-local function Send(msg)
-    if not IsInGuild or IsInGuild() then
-        SendAddonMessage(PREFIX, msg, "GUILD")
-    else
-        Print("not in a guild, cannot sync.")
-    end
-end
 
-local function SerializeSafe(s)
-    s = tostring(s or "")
-    s = string.gsub(s, "~", "-")
-    s = string.gsub(s, "|", "/")
-    s = string.gsub(s, "\n", " ")
-    return s
-end
-
-local function ItemString(item)
-    if item and item.id and item.id ~= "0" then
-        return "item:" .. tostring(item.id) .. ":0:0:0"
-    end
-
-    return nil
-end
-
-local function ItemTexture(item)
-    if item and item.texture and item.texture ~= "" then
-        return item.texture
-    end
-
-    local itemString = ItemString(item)
-
-    if itemString and GetItemInfo then
-        local _, _, _, _, _, _, _, _, _, texture = GetItemInfo(itemString)
-        if texture then return texture end
-    end
-
-    return "Interface\\Icons\\INV_Misc_QuestionMark"
-end
-
-local function SyncBank(bankName)
-    EnsureDB()
-
-    local bank = GBankKronos112DB.banks[bankName]
-    if not bank then return false end
-
-    if not CanRelayCachedBank(bankName) then
-        RequestGuildRoster()
-        Print("sync skipped for " .. tostring(bankName) .. ". Snapshot owner is not marked '" .. BANKER_NOTE_TOKEN .. "', or officer notes are not readable.")
-        return false
-    end
-
-    local owner = BankSnapshotOwner(bankName)
-    local session = tostring(Now()) .. tostring(math.random(100, 999))
-
-    Send(
-        "START" .. DELIM ..
-        session .. DELIM ..
-        SerializeSafe(bankName) .. DELIM ..
-        tostring(bank.updated or Now()) .. DELIM ..
-        VERSION .. DELIM ..
-        SerializeSafe(owner)
-    )
-
-    local key, item
-
-    for key, item in pairs(bank.items or {}) do
-        Send(
-            "ITEM" .. DELIM ..
-            session .. DELIM ..
-            SerializeSafe(bankName) .. DELIM ..
-            SerializeSafe(item.name) .. DELIM ..
-            tostring(item.id or "0") .. DELIM ..
-            tostring(item.count or 0) .. DELIM ..
-            SerializeSafe(item.texture or "")
-        )
-    end
-
-    Send("END" .. DELIM .. session .. DELIM .. SerializeSafe(bankName))
-    return true
-end
-
-local function SyncAll()
-    EnsureDB()
-
-    local sent = 0
-    local skipped = 0
-    local bankName, bank
-
-    for bankName, bank in pairs(GBankKronos112DB.banks) do
-        if SyncBank(bankName) then
-            sent = sent + 1
-        else
-            skipped = skipped + 1
-        end
-    end
-
-    Print("synced " .. sent .. " cached bank snapshot(s) to guild.")
-
-    if skipped > 0 then
-        Print("skipped " .. skipped .. " snapshot(s) because the original owner could not be validated.")
-    end
-end
-
-local function SplitBar(msg)
-    local t = {}
-    local part
-
-    for part in string.gfind(msg or "", "([^" .. DELIM .. "]+)") do
-        table.insert(t, part)
-    end
-
-    return t
-end
-
-local function OnAddonMessage(prefix, msg, channel, sender)
+OnAddonMessage = function(prefix, msg, channel, sender)
     if prefix ~= PREFIX then return end
     if sender == PlayerName() then return end
 
@@ -623,7 +414,8 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     local cmd = p[1]
 
     if cmd == "REQ" then
-        -- Anyone with a valid cached copy may answer. SyncBank validates each snapshot owner.
+        -- Anyone can request, but only gbank characters or officers who can
+        -- verify the snapshot owner will actually send anything.
         if GBankKronos112DB and GBankKronos112DB.banks then
             SyncAll()
         end
@@ -639,12 +431,9 @@ local function OnAddonMessage(prefix, msg, channel, sender)
 
         if not session or not bankName then return end
 
-        if not IsAuthorizedBanker(snapshotOwner) then
-            RequestGuildRoster()
-            Print("ignored bank snapshot " .. tostring(bankName) .. " from " .. tostring(sender) .. ". Snapshot owner " .. tostring(snapshotOwner) .. " is not marked '" .. BANKER_NOTE_TOKEN .. "', or officer notes are not readable.")
-            return
-        end
-
+        -- Receivers do not validate officer notes. Regular users cannot read them.
+        -- Validation happens on the sender side: gbank characters can sync directly,
+        -- and officers can relay only after verifying the snapshot owner has gbank.
         GBK.incoming[session] = {
             bankName = bankName,
             updated = updated,
@@ -712,27 +501,6 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     end
 end
 
-local function FormatTime(ts)
-    if not ts or ts == 0 or not date then return "never" end
-    return date("%m/%d %H:%M", ts)
-end
-
-local function SourcesText(item)
-    local s = ""
-    local first = true
-    local k
-
-    for k in pairs(item.tabs or {}) do
-        if first then
-            s = k
-            first = false
-        else
-            s = s .. ", " .. k
-        end
-    end
-
-    return s
-end
 
 function GBK.Refresh()
     if not GBK.frame then return end
@@ -786,13 +554,15 @@ function GBK.Refresh()
     end
 end
 
-local function SelectTab(tab)
+
+SelectTab = function(tab)
     GBK.tab = tab or "ALL"
     GBK.offset = 0
     GBK.Refresh()
 end
 
-local function MakeTabButton(parent, text, x, tab)
+
+MakeTabButton = function(parent, text, x, tab)
     local b = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
     b:SetWidth(72)
     b:SetHeight(20)
@@ -803,6 +573,7 @@ local function MakeTabButton(parent, text, x, tab)
     end)
     return b
 end
+
 
 RebuildTabButtons = function()
     if not GBK.frame then return end
@@ -836,7 +607,8 @@ RebuildTabButtons = function()
     end
 end
 
-local function CreateUI()
+
+CreateUI = function()
     if GBK.frame then return end
     EnsureDB()
 
@@ -1046,7 +818,8 @@ local function CreateUI()
     RebuildTabButtons()
 end
 
-local function ToggleUI()
+
+ToggleUI = function()
     CreateUI()
     RebuildTabButtons()
 
@@ -1058,7 +831,8 @@ local function ToggleUI()
     end
 end
 
-local function Help()
+
+Help = function()
     Print("commands:")
     Print("/gbank - open viewer")
     Print("/gbank scan [name] - scan bags, open bank, and open mailbox")
@@ -1072,7 +846,8 @@ local function Help()
     Print("bankers who create snapshots must have '" .. BANKER_NOTE_TOKEN .. "' in their guild officer note. Cached snapshots may be relayed by others if the owner validates.")
 end
 
-local function Slash(msg)
+
+Slash = function(msg)
     EnsureDB()
 
     msg = Trim(msg or "")
@@ -1130,6 +905,352 @@ local function Slash(msg)
         ToggleUI()
     end
 end
+
+
+
+-- ============================================================
+-- HELPER FUNCTIONS
+-- Shared utility functions used by the role sections above.
+-- ============================================================
+
+Now = function()
+    return time and time() or 0
+end
+
+
+PlayerName = function()
+    return UnitName("player") or "Unknown"
+end
+
+
+Lower = function(s)
+    if not s then return "" end
+    return string.lower(s)
+end
+
+
+Trim = function(s)
+    if not s then return "" end
+    s = string.gsub(s, "^%s+", "")
+    s = string.gsub(s, "%s+$", "")
+    return s
+end
+
+
+NormalizeName = function(name)
+    if not name then return "" end
+
+    local n = tostring(name)
+    local dash = string.find(n, "-", 1, true)
+
+    if dash then
+        n = string.sub(n, 1, dash - 1)
+    end
+
+    return Lower(Trim(n))
+end
+
+
+Print = function(msg)
+    DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffGBank|r: " .. tostring(msg))
+end
+
+
+EnsureDB = function()
+    if not GBankKronos112DB then GBankKronos112DB = {} end
+    if not GBankKronos112DB.banks then GBankKronos112DB.banks = {} end
+    if not GBankKronos112DB.limits then GBankKronos112DB.limits = {} end
+    if not GBankKronos112DB.options then GBankKronos112DB.options = {} end
+end
+
+
+RequestGuildRoster = function()
+    if GuildRoster then
+        GuildRoster()
+    end
+end
+
+
+IsAuthorizedBanker = function(name)
+    if not IsInGuild or not IsInGuild() then
+        return false
+    end
+
+    local target = NormalizeName(name)
+    if target == "" then return false end
+
+    if not GetNumGuildMembers or not GetGuildRosterInfo then
+        return false
+    end
+
+    local total = GetNumGuildMembers()
+
+    if not total or total < 1 then
+        RequestGuildRoster()
+        return false
+    end
+
+    local i
+    for i = 1, total do
+        local memberName, rank, rankIndex, level, class, zone, note, officerNote, online = GetGuildRosterInfo(i)
+
+        if NormalizeName(memberName) == target then
+            officerNote = officerNote or ""
+
+            if officerNote == "" then
+                return false
+            end
+
+            if string.find(Lower(officerNote), BANKER_NOTE_TOKEN, 1, true) then
+                return true
+            end
+
+            return false
+        end
+    end
+
+    RequestGuildRoster()
+    return false
+end
+
+
+IsPlayerAuthorizedBanker = function()
+    return IsAuthorizedBanker(PlayerName())
+end
+
+
+LinkName = function(link)
+    if not link then return nil end
+    local _, _, name = string.find(link, "%[(.-)%]")
+    return name
+end
+
+
+LinkItemId = function(link)
+    if not link then return "0" end
+    local _, _, id = string.find(link, "item:(%d+):")
+    return id or "0"
+end
+
+
+AddItem = function(items, name, itemId, count, source, slot, texture)
+    if not name or name == "" then return end
+    if not count or count < 1 then count = 1 end
+
+    local key = Lower(name)
+
+    if not items[key] then
+        items[key] = {
+            name = name,
+            id = itemId or "0",
+            count = 0,
+            source = source or "",
+            slots = {},
+            texture = texture or ""
+        }
+    end
+
+    items[key].count = items[key].count + count
+
+    if texture and texture ~= "" then
+        items[key].texture = texture
+    end
+
+    if source and slot then
+        table.insert(items[key].slots, source .. " " .. slot)
+    end
+end
+
+
+ScanContainer = function(items, bag, source)
+    local slots = GetContainerNumSlots(bag)
+    if not slots then return end
+
+    local i
+    for i = 1, slots do
+        local link = GetContainerItemLink(bag, i)
+
+        if link then
+            local texture, count = GetContainerItemInfo(bag, i)
+            local name = LinkName(link)
+            local itemId = LinkItemId(link)
+
+            AddItem(
+                items,
+                name,
+                itemId,
+                count or 1,
+                source,
+                tostring(bag) .. ":" .. tostring(i),
+                texture
+            )
+        end
+    end
+end
+
+
+ScanMail = function(items)
+    if not GetInboxNumItems then return 0 end
+    if MailFrame and not MailFrame:IsVisible() then return 0 end
+
+    local total = GetInboxNumItems()
+    if not total then return 0 end
+
+    local scanned = 0
+    local mailIndex
+
+    for mailIndex = 1, total do
+        local attachmentIndex
+
+        for attachmentIndex = 1, 16 do
+            local name = nil
+            local itemId = "0"
+            local count = 1
+            local texture = nil
+
+            if GetInboxItemLink then
+                local ok, itemLink = pcall(GetInboxItemLink, mailIndex, attachmentIndex)
+
+                if ok and itemLink then
+                    name = LinkName(itemLink)
+                    itemId = LinkItemId(itemLink)
+                end
+            end
+
+            if GetInboxItem then
+                local ok, itemName, itemTexture, itemCount = pcall(GetInboxItem, mailIndex, attachmentIndex)
+
+                if ok and itemName then
+                    if not name then name = itemName end
+                    if itemTexture then texture = itemTexture end
+                    if itemCount then count = itemCount end
+                end
+            end
+
+            if name then
+                AddItem(
+                    items,
+                    name,
+                    itemId,
+                    count,
+                    "Mail",
+                    tostring(mailIndex) .. ":" .. tostring(attachmentIndex),
+                    texture
+                )
+
+                scanned = scanned + 1
+            end
+        end
+    end
+
+    return scanned
+end
+
+
+IsBankOpen = function()
+    if BankFrame and BankFrame:IsVisible() then return true end
+    return false
+end
+
+
+SnapshotName = function(arg)
+    arg = Trim(arg or "")
+
+    if arg ~= "" then return arg end
+
+    return PlayerName()
+end
+
+
+LimitFor = function(name)
+    EnsureDB()
+    return GBankKronos112DB.limits[Lower(name)] or 0
+end
+
+
+Send = function(msg)
+    if not IsInGuild or IsInGuild() then
+        SendAddonMessage(PREFIX, msg, "GUILD")
+    else
+        Print("not in a guild, cannot sync.")
+    end
+end
+
+
+SerializeSafe = function(s)
+    s = tostring(s or "")
+    s = string.gsub(s, "~", "-")
+    s = string.gsub(s, "|", "/")
+    s = string.gsub(s, "\n", " ")
+    return s
+end
+
+
+ItemString = function(item)
+    if item and item.id and item.id ~= "0" then
+        return "item:" .. tostring(item.id) .. ":0:0:0"
+    end
+
+    return nil
+end
+
+
+ItemTexture = function(item)
+    if item and item.texture and item.texture ~= "" then
+        return item.texture
+    end
+
+    local itemString = ItemString(item)
+
+    if itemString and GetItemInfo then
+        local _, _, _, _, _, _, _, _, _, texture = GetItemInfo(itemString)
+        if texture then return texture end
+    end
+
+    return "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+
+SplitBar = function(msg)
+    local t = {}
+    local part
+
+    for part in string.gfind(msg or "", "([^" .. DELIM .. "]+)") do
+        table.insert(t, part)
+    end
+
+    return t
+end
+
+
+FormatTime = function(ts)
+    if not ts or ts == 0 or not date then return "never" end
+    return date("%m/%d %H:%M", ts)
+end
+
+
+SourcesText = function(item)
+    local s = ""
+    local first = true
+    local k
+
+    for k in pairs(item.tabs or {}) do
+        if first then
+            s = k
+            first = false
+        else
+            s = s .. ", " .. k
+        end
+    end
+
+    return s
+end
+
+
+
+-- ============================================================
+-- STARTUP
+-- ============================================================
 
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
